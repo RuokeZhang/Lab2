@@ -9,22 +9,22 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define BUFFER_SIZE 17  // MSS size
-#define DATA_SIZE 2     // Data portion size
-#define SEQ_NUM_SIZE 11 // Sequence number size
-#define MAXWAITTIME 2   // Maximum wait time for ACKs in seconds
-#define WINDOW_SIZE 10  // Window size
+#define BUFFER_SIZE 17
+#define DATA_SIZE 2
+#define SEQ_NUM_SIZE 11
+#define MAXWAITTIME 1
+#define WINDOW_SIZE 10
 
 int main(int argc, char *argv[])
 {
-    int sockfd;
+    int sd;
     int i;
     int j;
     int portNumber;
     struct sockaddr_in server_address;
     char serverIP[29];
     char send_buffer[BUFFER_SIZE];
-    char recv_buffer[100]; // Buffer for reading ACK, increased size for safety
+    char recv_buffer[11]; // Buffer for reading ACK, increased size for safety
     struct timeval timeout;
     socklen_t addrlen = sizeof(server_address);
     int seq_num = 0;
@@ -34,7 +34,7 @@ int main(int argc, char *argv[])
     int msg_length = 0;
     char *data;
     time_t timeSent, currentTime;
-    int data_offset = 0;
+    int remainingBytes;
 
     if (argc != 3)
     {
@@ -43,8 +43,7 @@ int main(int argc, char *argv[])
     }
 
     // Create a UDP socket
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    portNumber = strtol(argv[2], NULL, 10);
+    sd = socket(AF_INET, SOCK_DGRAM, 0);
     strcpy(serverIP, argv[1]);
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(portNumber);
@@ -58,105 +57,92 @@ int main(int argc, char *argv[])
 
     // Step 2: Determine the length of the string
     msg_length = strlen(user_input);
-
+    remainingBytes = msg_length;
     // Step 3: Send that length to the server
     sprintf(send_buffer, "%11d%4d", seq_num, msg_length);
     int net_msg_length = htonl(msg_length); // Convert message length to network byte order
 
     // Send the length of the message to the server
-    bytes_sent = sendto(sockfd, &net_msg_length, sizeof(net_msg_length), 0,
+    bytes_sent = sendto(sd, &net_msg_length, sizeof(net_msg_length), 0,
                         (struct sockaddr *)&server_address, addrlen);
     if (bytes_sent < 0)
     {
         perror("Send to server failed");
-        close(sockfd);
+        close(sd);
         return 1;
     }
 
-    // Make sure the server received the message length
     printf("Sent message length %d to server\n", msg_length);
 
-    // 存储数据包的序列号
-    int *acks_received = calloc(msg_length, sizeof(int));
-    if (acks_received == NULL)
+    int window_start = 0;
+    int window_end = WINDOW_SIZE;
+    if (window_end >= msg_length)
     {
-        perror("Memory allocation for acks_received failed");
-        close(sockfd);
-        return 1;
+        window_end = msg_length;
     }
-
-    // 使用循环初始化数组
-    for (i = 0; i < msg_length; ++i)
+    int acc_ack = 0, wish_ack;
+    while (window_start < msg_length)
     {
-        acks_received[i] = 0; // 初始化数组元素为0
-    }
-    int window_start = 0;             // 窗口的左端
-    int window_end = WINDOW_SIZE - 1; // 窗口的右端
-    // Step 4: Loop until all data is sent
-    int remaining_data = msg_length; // Remaining data to be sent
-
-    while (remaining_data > 0)
-    {
-        for (i = window_start; i <= window_end && i < msg_length;)
+        wish_ack = 0;
+        for (i = window_start; i < window_end; i += 2)
         {
-            if (!acks_received[i])
+            int data_to_send = (msg_length - i >= DATA_SIZE) ? DATA_SIZE : msg_length - i;
+            memset(send_buffer, 0, BUFFER_SIZE);
+            sprintf(send_buffer, "%11d%4d", i, data_to_send);
+            memcpy(send_buffer + 15, user_input + i, data_to_send);
+
+            bytes_sent = sendto(sd, send_buffer, BUFFER_SIZE, 0, (struct sockaddr *)&server_address, addrlen);
+            if (bytes_sent < 0)
             {
-                data_offset = i / 2 * DATA_SIZE;
-                int data_to_send = (remaining_data >= DATA_SIZE) ? DATA_SIZE : 1;
-
-                sprintf(send_buffer, "%11d%4d%s", i, data_to_send, user_input + data_offset);
-
-                // a) send 2 bytes of data
-                bytes_sent = sendto(sockfd, send_buffer, BUFFER_SIZE, 0, (struct sockaddr *)&server_address, addrlen);
-                if (bytes_sent < 0)
-                {
-                    perror("Send to server failed");
-                    break;
-                }
-                printf("sent %ld bytes, seqNumber %d, bottomOfwindow %d\n", bytes_sent, i, window_start);
+                perror("Send to server failed");
+                break;
             }
-            i += 2;
+            printf("sent %ld bytes, seqNumber %d, bottomOfwindow %d, end of the window %d, data: '%.*s'\n",
+                   bytes_sent, i, window_start, window_end, data_to_send, send_buffer + SEQ_NUM_SIZE + 4);
+            wish_ack++;
         }
+
         timeSent = time(NULL);
-        for (i = window_start; i <= window_end;)
+        acc_ack = 0;
+
+        while (acc_ack < wish_ack)
         {
-            if (!acks_received[i])
+            currentTime = time(NULL);
+            if (currentTime - timeSent > MAXWAITTIME)
             {
-                memset(recv_buffer, 0, sizeof(recv_buffer)); // Clear the buffer
-                rc = recvfrom(sockfd, &recv_buffer, 100, MSG_DONTWAIT, (struct sockaddr *)&server_address, &addrlen);
+                printf("Timeout, sequence number = %d, doinig resending\n", window_start);
+                break;
+            }
+
+            memset(recv_buffer, 0, sizeof(recv_buffer));
+            rc = recvfrom(sd, &recv_buffer, 11, MSG_DONTWAIT, (struct sockaddr *)&server_address, &addrlen);
+            if (rc > 0)
+            {
                 int ack_num;
                 sscanf(recv_buffer, "%11d", &ack_num);
-                if (ack_num == i)
+                if (ack_num == window_start)
                 {
-                    printf("ACK received %d\n", ack_num);
-                    remaining_data -= DATA_SIZE;
-                    acks_received[i] = 1;                        // 标记ACK已经收到
-                    window_start = i + 2;                        // 移动窗口的左端
-                    window_end = window_start + WINDOW_SIZE - 1; // 移动窗口的右端
-                }
-                else
-                {
-                    // printf("received ack is %d\n", ack_num);
-                    // printf("expected ack is %d\n", i);
-                    currentTime = time(NULL);
-                    if (currentTime - timeSent > MAXWAITTIME)
+                    printf("received ACK: %d\n", ack_num);
+                    acc_ack++;
+                    remainingBytes -= 2;
+                    if (remainingBytes < 0)
                     {
-                        printf("Timeout, sequence number = %d\n", i);
-
-                        // Resend all packets in the window
-                        for (j = i; j < WINDOW_SIZE + i - 1;)
-                        {
-                            acks_received[j] = 0;
-                            j += 2;
-                        }
-                        break; // Exit the loop to resend packets
+                        remainingBytes = 0;
+                    }
+                    window_start += 2;
+                    window_end = window_start + WINDOW_SIZE;
+                    if (window_end > msg_length)
+                    {
+                        window_end = msg_length;
+                    }
+                    if (window_start == window_end)
+                    {
+                        break;
                     }
                 }
             }
-            i += 2;
         }
     }
-    free(acks_received);
-    close(sockfd);
+    close(sd);
     return 0;
 }
